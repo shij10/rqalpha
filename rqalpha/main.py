@@ -26,6 +26,7 @@ import jsonpickle.ext.numpy as jsonpickle_numpy
 import pytz
 import requests
 import six
+import better_exceptions
 
 from . import const
 from .api import helper as api_helper
@@ -37,12 +38,11 @@ from .core.strategy_context import StrategyContext
 from .data.base_data_source import BaseDataSource
 from .data.data_proxy import DataProxy
 from .environment import Environment
-from .events import EVENT
+from .events import EVENT, Event
 from .execution_context import ExecutionContext
 from .interface import Persistable
-from .mod.mod_handler import ModHandler
+from .mod import ModHandler
 from .model.bar import BarMap
-from .model.account import MixedAccount
 from .utils import create_custom_exception, run_with_user_log_disabled, scheduler as mod_scheduler
 from .utils.exception import CustomException, is_user_exc, patch_user_exc
 from .utils.i18n import gettext as _
@@ -64,7 +64,7 @@ def _adjust_start_date(config, data_proxy):
     config.base.end_date = min(end, config.base.end_date)
     config.base.trading_calendar = data_proxy.get_trading_dates(config.base.start_date, config.base.end_date)
     if len(config.base.trading_calendar) == 0:
-        raise patch_user_exc(ValueError(_('There is no trading day between {start_date} and {end_date}.').format(
+        raise patch_user_exc(ValueError(_(u"There is no trading day between {start_date} and {end_date}.").format(
             start_date=origin_start_date, end_date=origin_end_date)))
     config.base.start_date = config.base.trading_calendar[0].date()
     config.base.end_date = config.base.trading_calendar[-1].date()
@@ -77,7 +77,7 @@ def _validate_benchmark(config, data_proxy):
         return
     instrument = data_proxy.instruments(benchmark)
     if instrument is None:
-        raise patch_user_exc(ValueError(_('invalid benchmark {}').format(benchmark)))
+        raise patch_user_exc(ValueError(_(u"invalid benchmark {}").format(benchmark)))
 
     if instrument.order_book_id == "000300.XSHG":
         # 000300.XSHG 数据进行了补齐，因此认为只要benchmark设置了000300.XSHG，就存在数据，不受限于上市日期。
@@ -87,12 +87,35 @@ def _validate_benchmark(config, data_proxy):
     end_date = config.base.end_date
     if instrument.listed_date.date() > start_date:
         raise patch_user_exc(ValueError(
-            _("benchmark {benchmark} has not been listed on {start_date}").format(benchmark=benchmark,
-                                                                                  start_date=start_date)))
+            _(u"benchmark {benchmark} has not been listed on {start_date}").format(benchmark=benchmark,
+                                                                                   start_date=start_date)))
     if instrument.de_listed_date.date() < end_date:
         raise patch_user_exc(ValueError(
-            _("benchmark {benchmark} has been de_listed on {end_date}").format(benchmark=benchmark,
-                                                                               end_date=end_date)))
+            _(u"benchmark {benchmark} has been de_listed on {end_date}").format(benchmark=benchmark,
+                                                                                end_date=end_date)))
+
+
+def create_benchmark_portfolio(env):
+    if env.config.base.benchmark is None:
+        return None
+
+    from .const import ACCOUNT_TYPE
+    from .model.account import BenchmarkAccount
+    from .model.position import Positions, StockPosition
+    from .model.portfolio import Portfolio
+    accounts = {}
+    config = env.config
+    start_date = config.base.start_date
+    total_cash = 0
+    for account_type in config.base.account_list:
+        if account_type == ACCOUNT_TYPE.STOCK:
+            total_cash += config.base.stock_starting_cash
+        elif account_type == ACCOUNT_TYPE.FUTURE:
+            total_cash += config.base.future_starting_cash
+        else:
+            raise NotImplementedError
+    accounts[ACCOUNT_TYPE.BENCHMARK] = BenchmarkAccount(total_cash, Positions(StockPosition))
+    return Portfolio(start_date, 1, total_cash, accounts)
 
 
 def create_base_scope():
@@ -117,7 +140,7 @@ def update_bundle(data_bundle_path=None, locale="zh_Hans_CN", confirm=True):
         data_bundle_path = os.path.abspath(os.path.join(data_bundle_path, './bundle/'))
     if (confirm and os.path.exists(data_bundle_path) and data_bundle_path != default_bundle_path and
             os.listdir(data_bundle_path)):
-        click.confirm(_("""
+        click.confirm(_(u"""
 [WARNING]
 Target bundle path {data_bundle_path} is not empty.
 The content of this folder will be REMOVED before updating.
@@ -129,7 +152,7 @@ Are you sure to continue?""").format(data_bundle_path=data_bundle_path), abort=T
     while True:
         url = 'http://7xjci3.com1.z0.glb.clouddn.com/bundles_v2/rqbundle_%04d%02d%02d.tar.bz2' % (
             day.year, day.month, day.day)
-        six.print_(_('try {} ...').format(url))
+        six.print_(_(u"try {} ...").format(url))
         r = requests.get(url, stream=True)
         if r.status_code != 200:
             day = day - datetime.timedelta(days=1)
@@ -138,7 +161,7 @@ Are you sure to continue?""").format(data_bundle_path=data_bundle_path), abort=T
         out = open(tmp, 'wb')
         total_length = int(r.headers.get('content-length'))
 
-        with click.progressbar(length=total_length, label=_('downloading ...')) as bar:
+        with click.progressbar(length=total_length, label=_(u"downloading ...")) as bar:
             for data in r.iter_content(chunk_size=8192):
                 bar.update(len(data))
                 out.write(data)
@@ -152,7 +175,7 @@ Are you sure to continue?""").format(data_bundle_path=data_bundle_path), abort=T
     tar.extractall(data_bundle_path)
     tar.close()
     os.remove(tmp)
-    six.print_(_("Data bundle download successfully in {bundle_path}").format(bundle_path=data_bundle_path))
+    six.print_(_(u"Data bundle download successfully in {bundle_path}").format(bundle_path=data_bundle_path))
 
 
 def run(config, source_code=None):
@@ -171,7 +194,6 @@ def run(config, source_code=None):
             env.set_data_source(BaseDataSource(config.base.data_bundle_path))
 
         env.set_data_proxy(DataProxy(env.data_source))
-        ExecutionContext.data_proxy = env.data_proxy
         Scheduler.set_trading_dates_(env.data_source.get_trading_calendar())
         scheduler = Scheduler(config.base.frequency)
         mod_scheduler._scheduler = scheduler
@@ -184,27 +206,28 @@ def run(config, source_code=None):
 
         broker = env.broker
         assert broker is not None
-        env.accounts = accounts = broker.get_accounts()
-        env.account = account = MixedAccount(accounts)
-
-        ExecutionContext.broker = broker
-        ExecutionContext.accounts = accounts
-        ExecutionContext.account = account
-        ExecutionContext.config = env.config
+        env.portfolio = broker.get_portfolio()
+        env.benchmark_portfolio = create_benchmark_portfolio(env)
 
         event_source = env.event_source
         assert event_source is not None
 
         bar_dict = BarMap(env.data_proxy, config.base.frequency)
-        ctx = ExecutionContext(const.EXECUTION_PHASE.GLOBAL, bar_dict)
+        env.set_bar_dict(bar_dict)
+
+        if env.price_board is None:
+            from .core.bar_dict_price_board import BarDictPriceBoard
+            env.price_board = BarDictPriceBoard(bar_dict)
+
+        ctx = ExecutionContext(const.EXECUTION_PHASE.GLOBAL)
         ctx._push()
 
         # FIXME
         start_dt = datetime.datetime.combine(config.base.start_date, datetime.datetime.min.time())
-        env.calendar_dt = ExecutionContext.calendar_dt = start_dt
-        env.trading_dt = ExecutionContext.trading_dt = start_dt
+        env.calendar_dt = start_dt
+        env.trading_dt = start_dt
 
-        env.event_bus.publish_event(EVENT.POST_SYSTEM_INIT)
+        env.event_bus.publish_event(Event(EVENT.POST_SYSTEM_INIT))
 
         scope = create_base_scope()
         scope.update({
@@ -240,16 +263,18 @@ def run(config, source_code=None):
             persist_helper.register('universe', env._universe)
             if isinstance(event_source, Persistable):
                 persist_helper.register('event_source', event_source)
-            for k, v in six.iteritems(accounts):
-                persist_helper.register('{}_account'.format(k.name.lower()), v)
+            persist_helper.register('portfolio', env.portfolio)
+            if env.benchmark_portfolio:
+                persist_helper.register('benchmark_portfolio', env.benchmark_portfolio)
             for name, module in six.iteritems(env.mod_dict):
                 if isinstance(module, Persistable):
                     persist_helper.register('mod_{}'.format(name), module)
             # broker will restore open orders from account
-            persist_helper.register('broker', broker)
+            if isinstance(broker, Persistable):
+                persist_helper.register('broker', broker)
 
             persist_helper.restore()
-            env.event_bus.publish_event(EVENT.POST_SYSTEM_RESTORED)
+            env.event_bus.publish_event(Event(EVENT.POST_SYSTEM_RESTORED))
 
         init_succeed = True
 
@@ -260,56 +285,24 @@ def run(config, source_code=None):
             with run_with_user_log_disabled(disabled=False):
                 user_strategy.init()
 
-        for event in event_source.events(config.base.start_date, config.base.end_date, config.base.frequency):
-            calendar_dt = event.calendar_dt
-            trading_dt = event.trading_dt
-            event_type = event.event_type
-            ExecutionContext.calendar_dt = calendar_dt
-            ExecutionContext.trading_dt = trading_dt
-            env.calendar_dt = calendar_dt
-            env.trading_dt = trading_dt
-            for account in accounts.values():
-                account.portfolio._current_date = trading_dt.date()
-
-            if event_type == EVENT.BEFORE_TRADING:
-                env.event_bus.publish_event(EVENT.PRE_BEFORE_TRADING)
-                env.event_bus.publish_event(EVENT.BEFORE_TRADING)
-                env.event_bus.publish_event(EVENT.POST_BEFORE_TRADING)
-            elif event_type == EVENT.BAR:
-                bar_dict.update_dt(calendar_dt)
-                env.event_bus.publish_event(EVENT.PRE_BAR)
-                env.event_bus.publish_event(EVENT.BAR, bar_dict)
-                env.event_bus.publish_event(EVENT.POST_BAR)
-            elif event_type == EVENT.TICK:
-                env.event_bus.publish_event(EVENT.PRE_TICK)
-                env.event_bus.publish_event(EVENT.TICK, event.data['tick'])
-                env.event_bus.publish_event(EVENT.POST_TICK)
-            elif event_type == EVENT.AFTER_TRADING:
-                env.event_bus.publish_event(EVENT.PRE_AFTER_TRADING)
-                env.event_bus.publish_event(EVENT.AFTER_TRADING)
-                env.event_bus.publish_event(EVENT.POST_AFTER_TRADING)
-            elif event_type == EVENT.SETTLEMENT:
-                env.event_bus.publish_event(EVENT.PRE_SETTLEMENT)
-                env.event_bus.publish_event(EVENT.SETTLEMENT)
-                env.event_bus.publish_event(EVENT.POST_SETTLEMENT)
-            else:
-                raise RuntimeError(_('unknown event from event source: {}').format(event))
+        from .core.executor import Executor
+        Executor(env).run(bar_dict)
 
         if env.profile_deco:
             output_profile_result(env)
 
-        mod_handler.tear_down(const.EXIT_CODE.EXIT_SUCCESS)
-        system_log.debug(_("strategy run successfully, normal exit"))
-
-        # FIXME
-        if 'analyser' in env.mod_dict:
-            return env.mod_dict['analyser']._result
+        result = mod_handler.tear_down(const.EXIT_CODE.EXIT_SUCCESS)
+        system_log.debug(_(u"strategy run successfully, normal exit"))
+        return result
     except CustomException as e:
         if init_succeed and env.config.base.persist and persist_helper:
             persist_helper.persist()
 
-        user_detail_log.exception(_("strategy execute exception"))
+        user_detail_log.exception(_(u"strategy execute exception"))
         user_system_log.error(e.error)
+
+        better_exceptions.excepthook(e.error.exc_type, e.error.exc_val, e.error.exc_tb)
+
         mod_handler.tear_down(const.EXIT_CODE.EXIT_USER_ERROR, e)
     except Exception as e:
         if init_succeed and env.config.base.persist and persist_helper:
@@ -318,13 +311,14 @@ def run(config, source_code=None):
         exc_type, exc_val, exc_tb = sys.exc_info()
         user_exc = create_custom_exception(exc_type, exc_val, exc_tb, config.base.strategy_file)
 
+        better_exceptions.excepthook(exc_type, exc_val, exc_tb)
         user_system_log.error(user_exc.error)
         code = const.EXIT_CODE.EXIT_USER_ERROR
         if not is_user_exc(exc_val):
-            system_log.exception(_("strategy execute exception"))
+            system_log.exception(_(u"strategy execute exception"))
             code = const.EXIT_CODE.EXIT_INTERNAL_ERROR
         else:
-            user_detail_log.exception(_("strategy execute exception"))
+            user_detail_log.exception(_(u"strategy execute exception"))
 
         mod_handler.tear_down(code, user_exc)
 
@@ -353,4 +347,4 @@ def output_profile_result(env):
     profile_output = stdout_trap.getvalue()
     profile_output = profile_output.rstrip()
     print(profile_output)
-    env.event_bus.publish_event(EVENT.ON_LINE_PROFILER_RESULT, profile_output)
+    env.event_bus.publish_event(Event(EVENT.ON_LINE_PROFILER_RESULT, result=profile_output))

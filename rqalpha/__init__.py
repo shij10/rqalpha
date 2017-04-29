@@ -19,6 +19,9 @@ RQAlpha - a Algorithm Trading System
 """
 
 import pkgutil
+from .__main__ import cli
+from .cmd import cmd_cli
+from .api.api_base import export_as_api
 
 __all__ = [
     '__version__',
@@ -42,6 +45,6 @@ def run(config, source_code=None):
     return main.run(parse_config(config, click_type=False, source_code=source_code), source_code=source_code)
 
 
-def update_bundle(data_bundle_path=None, confirm=True):
+def update_bundle(data_bundle_path=None, locale="zh_Hans_CN", confirm=True):
     from . import main
-    main.update_bundle(data_bundle_path, confirm)
+    main.update_bundle(data_bundle_path=data_bundle_path, locale=locale, confirm=confirm)

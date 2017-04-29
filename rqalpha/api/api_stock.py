@@ -31,10 +31,13 @@ from ..execution_context import ExecutionContext
 from ..model.instrument import Instrument
 from ..model.order import Order, OrderStyle, MarketOrder, LimitOrder
 from ..utils.arg_checker import apply_rules, verify_that
+# noinspection PyUnresolvedReferences
 from ..utils.exception import patch_user_exc, RQInvalidArgument
 from ..utils.i18n import gettext as _
 from ..utils.logger import user_system_log
+# noinspection PyUnresolvedReferences
 from ..utils.scheduler import market_close, market_open
+# noinspection PyUnresolvedReferences
 from ..utils import scheduler
 
 # 使用Decimal 解决浮点数运算精度问题
@@ -86,31 +89,18 @@ def order_shares(id_or_ins, amount, style=MarketOrder()):
         #购买1000股的平安银行股票，并以限价单发送，价格为￥10：
         order_shares('000001.XSHG', 1000, style=LimitOrder(10))
     """
-    # Place an order by specified number of shares. Order type is also
-    #     passed in as parameters if needed. If style is omitted, it fires a
-    #     market order by default.
-    # :PARAM id_or_ins: the instrument to be ordered
-    # :type id_or_ins: str or Instrument
-    # :param float amount: Number of shares to order. Positive means buy,
-    #     negative means sell. It will be rounded down to the closest
-    #     integral multiple of the lot size
-    # :param style: Order type and default is `MarketOrder()`. The
-    #     available order types are: `MarketOrder()` and
-    #     `LimitOrder(limit_price)`
-    # :return:  A unique order id.
-    # :rtype: int
+    if amount is 0:
+        # 如果下单量为0，则认为其并没有发单，则直接返回None
+        return None
     if not isinstance(style, OrderStyle):
-        raise RQInvalidArgument(_('style should be OrderStyle'))
+        raise RQInvalidArgument(_(u"style should be OrderStyle"))
     if isinstance(style, LimitOrder):
         if style.get_limit_price() <= 0:
-            raise RQInvalidArgument(_("Limit order price should be positive"))
-
+            raise RQInvalidArgument(_(u"Limit order price should be positive"))
     order_book_id = assure_stock_order_book_id(id_or_ins)
-    bar_dict = ExecutionContext.get_current_bar_dict()
-    bar = bar_dict[order_book_id]
-    price = bar.close
-    calendar_dt = ExecutionContext.get_current_calendar_dt()
-    trading_dt = ExecutionContext.get_current_trading_dt()
+    env = Environment.get_instance()
+
+    price = env.get_last_price(order_book_id)
 
     if amount > 0:
         side = SIDE.BUY
@@ -118,29 +108,31 @@ def order_shares(id_or_ins, amount, style=MarketOrder()):
         amount = abs(amount)
         side = SIDE.SELL
 
-    round_lot = int(ExecutionContext.data_proxy.instruments(order_book_id).round_lot)
+    round_lot = int(env.get_instrument(order_book_id).round_lot)
 
     try:
         amount = int(Decimal(amount) / Decimal(round_lot)) * round_lot
     except ValueError:
         amount = 0
 
-    r_order = Order.__from_create__(calendar_dt, trading_dt, order_book_id, amount, side, style, None)
+    r_order = Order.__from_create__(env.calendar_dt, env.trading_dt, order_book_id, amount, side, style, None)
 
-    if bar.isnan or price == 0:
-        user_system_log.warn(_("Order Creation Failed: [{order_book_id}] No market data").format(order_book_id=order_book_id))
-        r_order._mark_rejected(_("Order Creation Failed: [{order_book_id}] No market data").format(order_book_id=order_book_id))
+    if price == 0:
+        user_system_log.warn(
+            _(u"Order Creation Failed: [{order_book_id}] No market data").format(order_book_id=order_book_id))
+        r_order.mark_rejected(
+            _(u"Order Creation Failed: [{order_book_id}] No market data").format(order_book_id=order_book_id))
         return r_order
 
     if amount == 0:
         # 如果计算出来的下单量为0, 则不生成Order, 直接返回None
         # 因为很多策略会直接在handle_bar里面执行order_target_percent之类的函数，经常会出现下一个量为0的订单，如果这些订单都生成是没有意义的。
-        r_order._mark_rejected(_("Order Creation Failed: 0 order quantity"))
+        r_order.mark_rejected(_(u"Order Creation Failed: 0 order quantity"))
         return r_order
     if r_order.type == ORDER_TYPE.MARKET:
-        bar_dict = ExecutionContext.get_current_bar_dict()
-        r_order._frozen_price = bar_dict[order_book_id].close
-    ExecutionContext.broker.submit_order(r_order)
+        r_order.set_frozen_price(price)
+    if env.can_submit_order(r_order):
+        env.broker.submit_order(r_order)
 
     return r_order
 
@@ -175,21 +167,9 @@ def order_lots(id_or_ins, amount, style=MarketOrder()):
         order_lots('000001.XSHE', 10, style=LimitOrder(10))
 
     """
-    # Place an order by specified number of lots. Order type is also passed
-    #     in as parameters if needed. If style is omitted, it fires a market
-    #     order by default.
-    # :param id_or_ins: the instrument to be ordered
-    # :type id_or_ins: str or Instrument
-    # :param float amount: Number of lots to order. Positive means buy,
-    #     negative means sell.
-    # :param style: Order type and default is `MarketOrder()`. The
-    #     available order types are: `MarketOrder()` and
-    #     `LimitOrder(limit_price)`
-    # :return:  A unique order id.
-    # :rtype: int
     order_book_id = assure_stock_order_book_id(id_or_ins)
 
-    round_lot = int(ExecutionContext.get_instrument(order_book_id).round_lot)
+    round_lot = int(Environment.get_instance().get_instrument(order_book_id).round_lot)
 
     return order_shares(id_or_ins, amount * round_lot, style)
 
@@ -224,40 +204,25 @@ def order_value(id_or_ins, cash_amount, style=MarketOrder()):
         order_value('000001.XSHE', -10000)
 
     """
-    # Place an order by specified value amount rather than specific number
-    #     of shares/lots. Negative cash_amount results in selling the given
-    #     amount of value, if the cash_amount is larger than you current
-    #     security’s position, then it will sell all shares of this security.
-    #     Orders are always truncated to whole lot shares.
-    # :param id_or_ins: the instrument to be ordered
-    # :type id_or_ins: str or Instrument
-    # :param float cash_amount: Cash amount to buy / sell the given value of
-    #     securities. Positive means buy, negative means sell.
-    # :param style: Order type and default is `MarketOrder()`. The
-    #     available order types are: `MarketOrder()` and
-    #     `LimitOrder(limit_price)`
-    # :return:  A unique order id.
-    # :rtype: int
     if not isinstance(style, OrderStyle):
-        raise RQInvalidArgument(_('style should be OrderStyle'))
+        raise RQInvalidArgument(_(u"style should be OrderStyle"))
     if isinstance(style, LimitOrder):
         if style.get_limit_price() <= 0:
-            raise RQInvalidArgument(_("Limit order price should be positive"))
+            raise RQInvalidArgument(_(u"Limit order price should be positive"))
 
     order_book_id = assure_stock_order_book_id(id_or_ins)
+    env = Environment.get_instance()
 
-    bar_dict = ExecutionContext.get_current_bar_dict()
-    bar = bar_dict[order_book_id]
-    price = bar.close
+    price = env.get_last_price(order_book_id)
 
-    if bar.isnan or price == 0:
+    if price == 0:
         return order_shares(order_book_id, 0, style)
 
-    account = ExecutionContext.accounts[ACCOUNT_TYPE.STOCK]
-    round_lot = int(ExecutionContext.get_instrument(order_book_id).round_lot)
+    account = env.portfolio.accounts[ACCOUNT_TYPE.STOCK]
+    round_lot = int(env.get_instrument(order_book_id).round_lot)
 
     if cash_amount > 0:
-        cash_amount = min(cash_amount, account.portfolio.cash)
+        cash_amount = min(cash_amount, account.cash)
 
     if isinstance(style, MarketOrder):
         amount = int(Decimal(cash_amount) / Decimal(price) / Decimal(round_lot)) * round_lot
@@ -267,7 +232,7 @@ def order_value(id_or_ins, cash_amount, style=MarketOrder()):
     # if the cash_amount is larger than you current security’s position,
     # then it will sell all shares of this security.
 
-    position = account.portfolio.positions[order_book_id]
+    position = account.positions[order_book_id]
     amount = downsize_amount(amount, position)
 
     return order_shares(order_book_id, amount, style)
@@ -277,7 +242,7 @@ def order_value(id_or_ins, cash_amount, style=MarketOrder()):
 @ExecutionContext.enforce_phase(EXECUTION_PHASE.ON_BAR,
                                 EXECUTION_PHASE.SCHEDULED)
 @apply_rules(verify_that('id_or_ins').is_valid_stock(),
-             verify_that('percent').is_number().is_greater_than(-1).is_less_than(1),
+             verify_that('percent').is_number().is_greater_or_equal_than(-1).is_less_or_equal_than(1),
              verify_that('style').is_instance_of((MarketOrder, LimitOrder)))
 def order_percent(id_or_ins, percent, style=MarketOrder()):
     """
@@ -300,28 +265,11 @@ def order_percent(id_or_ins, percent, style=MarketOrder()):
         #买入等于现有投资组合50%价值的平安银行股票。如果现在平安银行的股价是￥10/股并且现在的投资组合总价值是￥2000，那么将会买入200股的平安银行股票。（不包含交易成本和滑点的损失）：
         order_percent('000001.XSHG', 0.5)
     """
-    # Place an order for a security for a given percent of the current
-    #     portfolio value, which is the sum of the positions value and
-    #     ending cash balance. A negative percent order will result in
-    #     selling given percent of current portfolio value. Orders are
-    #     always truncated to whole shares. Percent should be a decimal
-    #     number (0.50 means 50%), and its absolute value is <= 1.
-    # :param id_or_ins: the instrument to be ordered
-    # :type id_or_ins: str or Instrument
-    # :param float percent: Percent of the current portfolio value. Positive
-    #     means buy, negative means selling give percent of the current
-    #     portfolio value. Orders are always truncated according to lot size.
-    # :param style: Order type and default is `MarketOrder()`. The
-    #     available order types are: `MarketOrder()` and
-    #     `LimitOrder(limit_price)`
-    # :return:  A unique order id.
-    # :rtype: int
     if percent < -1 or percent > 1:
-        raise RQInvalidArgument(_('percent should between -1 and 1'))
+        raise RQInvalidArgument(_(u"percent should between -1 and 1"))
 
-    account = ExecutionContext.accounts[ACCOUNT_TYPE.STOCK]
-    portfolio_value = account.portfolio.portfolio_value
-    return order_value(id_or_ins, portfolio_value * percent, style)
+    account = Environment.get_instance().portfolio.accounts[ACCOUNT_TYPE.STOCK]
+    return order_value(id_or_ins, account.total_value * percent, style)
 
 
 @export_as_api
@@ -351,38 +299,18 @@ def order_target_value(id_or_ins, cash_amount, style=MarketOrder()):
         #如果现在的投资组合中持有价值￥3000的平安银行股票的仓位并且设置其目标价值为￥10000，以下代码范例会发送价值￥7000的平安银行的买单到市场。（向下调整到最接近每手股数即100的倍数的股数）：
         order_target_value('000001.XSHE', 10000)
     """
-    # Place an order to adjust a position to a target value. If there is no
-    #     position for the security, an order is placed for the whole amount
-    #     of target value. If there is already a position for the security,
-    #     an order is placed for the difference between target value and
-    #     current position value.
-    # :param id_or_ins: the instrument to be ordered
-    # :type id_or_ins: str or Instrument
-    # :param float cash_amount: Target cash value for the adjusted position
-    #     after placing order.
-    # :param style: Order type and default is `MarketOrder()`. The
-    #     available order types are: `MarketOrder()` and
-    #     `LimitOrder(limit_price)`
-    # :return:  A unique order id.
-    # :rtype: int
     order_book_id = assure_stock_order_book_id(id_or_ins)
+    account = Environment.get_instance().portfolio.accounts[ACCOUNT_TYPE.STOCK]
+    position = account.positions[order_book_id]
 
-    bar_dict = ExecutionContext.get_current_bar_dict()
-    bar = bar_dict[order_book_id]
-    price = 0 if bar.isnan else bar.close
-
-    position = ExecutionContext.accounts[ACCOUNT_TYPE.STOCK].portfolio.positions[order_book_id]
-
-    current_value = position._quantity * price
-
-    return order_value(order_book_id, cash_amount - current_value, style)
+    return order_value(order_book_id, cash_amount - position.market_value, style)
 
 
 @export_as_api
 @ExecutionContext.enforce_phase(EXECUTION_PHASE.ON_BAR,
                                 EXECUTION_PHASE.SCHEDULED)
 @apply_rules(verify_that('id_or_ins').is_valid_stock(),
-             verify_that('percent').is_number().is_greater_than(0).is_less_than(1),
+             verify_that('percent').is_number().is_greater_or_equal_than(0).is_less_or_equal_than(1),
              verify_that('style').is_instance_of((MarketOrder, LimitOrder)))
 def order_target_percent(id_or_ins, percent, style=MarketOrder()):
     """
@@ -416,39 +344,61 @@ def order_target_percent(id_or_ins, percent, style=MarketOrder()):
         #如果投资组合中已经有了平安银行股票的仓位，并且占据目前投资组合的10%的价值，那么以下代码会买入平安银行股票最终使其占据投资组合价值的15%：
         order_target_percent('000001.XSHE', 0.15)
     """
-    # Place an order to adjust position to a target percent of the portfolio
-    #     value, so that your final position value takes the percentage you
-    #     defined of your whole portfolio.
-    #     position_to_adjust = target_position - current_position
-    #     Portfolio value is calculated as sum of positions value and ending
-    #     cash balance. The order quantity will be rounded down to integral
-    #     multiple of lot size. Percent should be a decimal number (0.50
-    #     means 50%), and its absolute value is <= 1. If the
-    #     position_to_adjust calculated is positive, then it fires buy
-    #     orders, otherwise it fires sell orders.
-    # :param id_or_ins: the instrument to be ordered
-    # :type id_or_ins: str or Instrument
-    # :param float percent: Number of percent to order. It will be rounded down
-    #     to the closest integral multiple of the lot size
-    # :param style: Order type and default is `MarketOrder()`. The
-    #     available order types are: `MarketOrder()` and
-    #     `LimitOrder(limit_price)`
-    # :return:  A unique order id.
-    # :rtype: int
     if percent < 0 or percent > 1:
-        raise RQInvalidArgument(_('percent should between 0 and 1'))
+        raise RQInvalidArgument(_(u"percent should between 0 and 1"))
     order_book_id = assure_stock_order_book_id(id_or_ins)
 
-    bar_dict = ExecutionContext.get_current_bar_dict()
-    bar = bar_dict[order_book_id]
-    price = 0 if bar.isnan else bar.close
+    account = Environment.get_instance().portfolio.accounts[ACCOUNT_TYPE.STOCK]
+    position = account.positions[order_book_id]
 
-    portfolio = ExecutionContext.accounts[ACCOUNT_TYPE.STOCK].portfolio
-    position = portfolio.positions[order_book_id]
+    return order_value(order_book_id, account.total_value * percent - position.market_value, style)
 
-    current_value = position._quantity * price
 
-    return order_value(order_book_id, portfolio.portfolio_value * percent - current_value, style)
+@export_as_api
+@ExecutionContext.enforce_phase(EXECUTION_PHASE.ON_INIT,
+                                EXECUTION_PHASE.BEFORE_TRADING,
+                                EXECUTION_PHASE.ON_BAR,
+                                EXECUTION_PHASE.AFTER_TRADING,
+                                EXECUTION_PHASE.SCHEDULED)
+@apply_rules(verify_that('order_book_id').is_valid_instrument(),
+             verify_that('count').is_greater_than(0))
+def is_suspended(order_book_id, count=1):
+    """
+    判断某只股票是否全天停牌。
+
+    :param str order_book_id: 某只股票的代码或股票代码，可传入单只股票的order_book_id, symbol
+
+    :param int count: 回溯获取的数据个数。默认为当前能够获取到的最近的数据
+
+    :return: count为1时 `bool`; count>1时 `pandas.DataFrame`
+    """
+    dt = Environment.get_instance().calendar_dt.date()
+    order_book_id = assure_stock_order_book_id(order_book_id)
+    return Environment.get_instance().data_proxy.is_suspended(order_book_id, dt, count)
+
+
+@export_as_api
+@ExecutionContext.enforce_phase(EXECUTION_PHASE.ON_INIT,
+                                EXECUTION_PHASE.BEFORE_TRADING,
+                                EXECUTION_PHASE.ON_BAR,
+                                EXECUTION_PHASE.AFTER_TRADING,
+                                EXECUTION_PHASE.SCHEDULED)
+@apply_rules(verify_that('order_book_id').is_valid_instrument())
+def is_st_stock(order_book_id, count=1):
+    """
+    判断股票在一段时间内是否为ST股（包括ST与*ST）。
+
+    ST股是有退市风险因此风险比较大的股票，很多时候您也会希望判断自己使用的股票是否是'ST'股来避开这些风险大的股票。另外，我们目前的策略比赛也禁止了使用'ST'股。
+
+    :param str order_book_id: 某只股票的代码，可传入单只股票的order_book_id, symbol
+
+    :param int count: 回溯获取的数据个数。默认为当前能够获取到的最近的数据
+
+    :return: count为1时 `bool`; count>1时 `pandas.DataFrame`
+    """
+    dt = Environment.get_instance().calendar_dt.date()
+    order_book_id = assure_stock_order_book_id(order_book_id)
+    return Environment.get_instance().data_proxy.is_st_stock(order_book_id, dt, count)
 
 
 def assure_stock_order_book_id(id_or_symbols):
@@ -462,12 +412,12 @@ def assure_stock_order_book_id(id_or_symbols):
             return order_book_id
         else:
             raise RQInvalidArgument(
-                _("{order_book_id} is not supported in current strategy type").format(
+                _(u"{order_book_id} is not supported in current strategy type").format(
                     order_book_id=order_book_id))
     elif isinstance(id_or_symbols, six.string_types):
         return assure_stock_order_book_id(instruments(id_or_symbols))
     else:
-        raise RQInvalidArgument(_("unsupported order_book_id type"))
+        raise RQInvalidArgument(_(u"unsupported order_book_id type"))
 
 
 def downsize_amount(amount, position):

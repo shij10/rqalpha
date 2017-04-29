@@ -13,18 +13,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 
 import six
-import os
 import numpy as np
-try:
-    # For Python 2 兼容
-    from functools import lru_cache
-except Exception as e:
-    from fastcache import lru_cache
 
+from ..utils.py2 import lru_cache
 from ..utils.datetime_func import convert_date_to_int, convert_int_to_date
 from ..interface import AbstractDataSource
+from .future_info_cn import CN_FUTURE_INFO
 from .converter import StockBarConverter, IndexBarConverter
 from .converter import FutureDayBarConverter, FundDayBarConverter
 from .daybar_store import DayBarStore
@@ -74,11 +71,11 @@ class BaseDataSource(AbstractDataSource):
     def get_all_instruments(self):
         return self._instruments.get_all_instruments()
 
-    def is_suspended(self, order_book_id, dt):
-        return self._suspend_days.contains(order_book_id, dt)
+    def is_suspended(self, order_book_id, dates):
+        return self._suspend_days.contains(order_book_id, dates)
 
-    def is_st_stock(self, order_book_id, dt):
-        return self._st_stock_days.contains(order_book_id, dt)
+    def is_st_stock(self, order_book_id, dates):
+        return self._st_stock_days.contains(order_book_id, dates)
 
     INSTRUMENT_TYPE_MAP = {
         'CS': 0,
@@ -137,7 +134,8 @@ class BaseDataSource(AbstractDataSource):
                 return False
         return True
 
-    def history_bars(self, instrument, bar_count, frequency, fields, dt, skip_suspended=True):
+    def history_bars(self, instrument, bar_count, frequency, fields, dt,
+                     skip_suspended=True, include_now=False):
         if frequency != '1d':
             raise NotImplementedError
 
@@ -170,9 +168,14 @@ class BaseDataSource(AbstractDataSource):
         return None
 
     def available_data_range(self, frequency):
-        if frequency == '1d':
+        if frequency in ['tick', '1d']:
             s, e = self._day_bars[self.INSTRUMENT_TYPE_MAP['INDX']].get_date_range('000001.XSHG')
             return convert_int_to_date(s).date(), convert_int_to_date(e).date()
 
-        if frequency == '1m':
-            raise NotImplementedError
+        raise NotImplementedError
+
+    def get_future_info(self, instrument, hedge_type):
+        return CN_FUTURE_INFO[instrument.underlying_symbol][hedge_type.value]
+
+    def get_ticks(self, order_book_id, date):
+        raise NotImplementedError

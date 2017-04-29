@@ -48,7 +48,6 @@ def handle_bar(context, bar_dict):
         # 使用第n-1日的收盘价作为当前价
         current_price = Close[2]
 
-
         Range = max((HH - LC), (HC - LL))
         K1 = 0.9
         BuyLine = Openprice + K1 * Range
@@ -65,7 +64,7 @@ def handle_bar(context, bar_dict):
 
 __config__ = {
     "base": {
-        "strategy_type": "stock",
+        "securities": "stock",
         "start_date": "2013-01-01",
         "end_date": "2015-12-29",
         "frequency": "1d",
@@ -78,9 +77,9 @@ __config__ = {
         "log_level": "error",
     },
     "mod": {
-        "progress": {
+        "sys_progress": {
             "enabled": True,
-            "priority": 400,
+            "show": True,
         },
     },
 }
